@@ -19,19 +19,10 @@ typedef struct {
     int requiredMines;
 } Constraint;
 
-#define MAX_COMP_CONSTRAINTS (MAX_COMPONENT_SIZE * 8)
-
 typedef struct {
-    int n;
-    int varCount[MAX_COMPONENT_SIZE];
-    int varCons[MAX_COMPONENT_SIZE][8];
-    int required[MAX_COMP_CONSTRAINTS];
-    int cnt[MAX_COMP_CONSTRAINTS];
-    int rem[MAX_COMP_CONSTRAINTS];
-    int cur[MAX_COMPONENT_SIZE];      
-    int mineCounts[MAX_COMPONENT_SIZE]; 
+    int* mineCounts;
     int totalValid;
-} BruteState;
+} BruteResult;
 
 typedef struct {
     bool foundGuaranteed;
@@ -155,41 +146,29 @@ int collectUnknownAndConstraints(const GameBoard* board, UnknownCellInfo unknown
     return unknownCount;
 }
 
-void bruteForceRec(int idx, BruteState* s) {
-    if (idx == s->n) {
-        s->totalValid++;
-        for (int i = 0; i < s->n; i++) {
-            s->mineCounts[i] += s->cur[i];
+void bruteForceRec(int idx, int currentMines[], int unknownCount, const Constraint constraints[], 
+                   int constrCount, const int localToGlobal[], BruteResult* result) {
+    if (idx == unknownCount) {
+        for (int c = 0; c < constrCount; c++) {
+            int cnt = 0;
+            for (int k = 0; k < constraints[c].neighborCount; k++) {
+                int globalIdx = localToGlobal[constraints[c].neighborIndices[k]];
+                if (globalIdx >= 0 && currentMines[globalIdx]) cnt++;
+            }
+            if (cnt != constraints[c].requiredMines) return;
+        }
+        
+        result->totalValid++;
+        for (int i = 0; i < unknownCount; i++) {
+            if (currentMines[i]) result->mineCounts[i]++;
         }
         return;
     }
-
-    const int vc = s->varCount[idx];
-    for (int v = 0; v <= 1; v++) {
-        int applied = 0;
-        bool ok = true;
-        for (; applied < vc; applied++) {
-            int c = s->varCons[idx][applied];
-            s->cnt[c] += v;
-            s->rem[c]--;
-            if (s->cnt[c] > s->required[c] || s->cnt[c] + s->rem[c] < s->required[c]) {
-                ok = false;
-                applied++;
-                break;
-            }
-        }
-
-        if (ok) {
-            s->cur[idx] = v;
-            bruteForceRec(idx + 1, s);
-        }
-
-        for (int k = 0; k < applied; k++) {
-            int c = s->varCons[idx][k];
-            s->cnt[c] -= v;
-            s->rem[c]++;
-        }
-    }
+    
+    currentMines[idx] = 0;
+    bruteForceRec(idx + 1, currentMines, unknownCount, constraints, constrCount, localToGlobal, result);
+    currentMines[idx] = 1;
+    bruteForceRec(idx + 1, currentMines, unknownCount, constraints, constrCount, localToGlobal, result);
 }
 
 void splitIntoComponents(int unknownCount, const Constraint constraints[], int constrCount,
@@ -236,62 +215,82 @@ void splitIntoComponents(int unknownCount, const Constraint constraints[], int c
     *numComponents = newId;
 }
 
-ComponentResult analyzeComponent(const UnknownCellInfo unknown[], int unknownCount,
-                                 const Constraint constraints[], int constrCount,
+ComponentResult analyzeComponent(const UnknownCellInfo unknown[], int unknownCount, 
+                                 const Constraint constraints[], int constrCount, 
                                  const int localToGlobal[]) {
     ComponentResult res = {false, -1, -1, 1.1, false};
-
+    
     if (unknownCount > MAX_COMPONENT_SIZE || unknownCount == 0) return res;
-    if (constrCount > MAX_COMP_CONSTRAINTS) return res;
-
-    BruteState s;
-    memset(&s, 0, sizeof(s));
-    s.n = unknownCount;
-
-    for (int c = 0; c < constrCount; c++) {
-        s.required[c] = constraints[c].requiredMines;
-        s.rem[c] = constraints[c].neighborCount;
-        for (int k = 0; k < constraints[c].neighborCount; k++) {
-            int v = constraints[c].neighborIndices[k];
-            if (v < 0 || v >= unknownCount || s.varCount[v] >= 8) return res;
-            s.varCons[v][s.varCount[v]++] = c;
-        }
+    
+    BruteResult result;
+    result.mineCounts = (int*)calloc(unknownCount, sizeof(int));
+    result.totalValid = 0;
+    
+    if (!result.mineCounts) return res;
+    
+    int* currentMines = (int*)calloc(unknownCount, sizeof(int));
+    if (!currentMines) {
+        free(result.mineCounts);
+        return res;
     }
-
-    bruteForceRec(0, &s);
-
-    if (s.totalValid == 0) return res;
-
+    
+    bruteForceRec(0, currentMines, unknownCount, constraints, constrCount, localToGlobal, &result);
+    free(currentMines);
+    
+    if (result.totalValid == 0) {
+        free(result.mineCounts);
+        return res;
+    }
+    
     double minProb = 1.1;
     int bestLocalIdx = -1;
-
+    
     for (int i = 0; i < unknownCount; i++) {
-        double prob = (double)s.mineCounts[i] / s.totalValid;
-        int globalIdx = localToGlobal[i];
-
-        if (prob == 0.0 || prob == 1.0) {
-            res.foundGuaranteed = true;
-            res.bestRow = unknown[globalIdx].row;
-            res.bestCol = unknown[globalIdx].col;
-            res.minProb = prob;
-            res.isFlag = (prob == 1.0);
-            return res;
+        double prob = (double)result.mineCounts[i] / result.totalValid;
+        
+        if (prob == 0.0) {
+            int globalIdx = localToGlobal[i];
+            if (globalIdx >= 0 && globalIdx < unknownCount) {
+                res.foundGuaranteed = true;
+                res.bestRow = unknown[globalIdx].row;
+                res.bestCol = unknown[globalIdx].col;
+                res.minProb = 0.0;
+                res.isFlag = false;
+                free(result.mineCounts);
+                return res;
+            }
         }
-
+        
+        if (prob == 1.0) {
+            int globalIdx = localToGlobal[i];
+            if (globalIdx >= 0 && globalIdx < unknownCount) {
+                res.foundGuaranteed = true;
+                res.bestRow = unknown[globalIdx].row;
+                res.bestCol = unknown[globalIdx].col;
+                res.minProb = 1.0;
+                res.isFlag = true;
+                free(result.mineCounts);
+                return res;
+            }
+        }
+        
         if (prob < minProb) {
             minProb = prob;
             bestLocalIdx = i;
         }
     }
-
+    
     if (bestLocalIdx != -1) {
         int globalIdx = localToGlobal[bestLocalIdx];
-        res.bestRow = unknown[globalIdx].row;
-        res.bestCol = unknown[globalIdx].col;
-        res.minProb = minProb;
-        res.isFlag = false;
+        if (globalIdx >= 0 && globalIdx < unknownCount) {
+            res.bestRow = unknown[globalIdx].row;
+            res.bestCol = unknown[globalIdx].col;
+            res.minProb = minProb;
+            res.isFlag = false;
+        }
     }
-
+    
+    free(result.mineCounts);
     return res;
 }
 
